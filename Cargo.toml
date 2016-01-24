@@ -7,3 +7,4 @@ authors = ["kujenga <ataylor0123@gmail.com>"]
 iron = "*"
 router = "*"
 redis = "*"
+image = "*"
