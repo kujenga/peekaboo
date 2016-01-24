@@ -38,7 +38,6 @@ fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
 }
 
 // from: https://github.com/iron/iron/blob/master/examples/time.rs
-
 struct ResponseTime;
 
 impl typemap::Key for ResponseTime { type Value = u64; }
@@ -58,17 +57,18 @@ impl AfterMiddleware for ResponseTime {
     }
 }
 
-struct GenImg {
+// ImgWriter writes a generated image out to the request
+struct ImgWriter {
     img: ImageBuffer<image::Luma<u8>, Vec<u8>>
 }
 
-impl Modifier<Response> for GenImg {
+impl Modifier<Response> for ImgWriter {
     fn modify(self, res: &mut Response) {
         res.body = Some(Box::new(self));
     }
 }
 
-impl response::WriteBody for GenImg {
+impl response::WriteBody for ImgWriter {
     fn write_body(&mut self, res: &mut response::ResponseBody) -> io::Result<()> {
         image::ImageLuma8(self.img.clone()).save(res, image::PNG)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
@@ -83,9 +83,10 @@ fn main() {
 	}
 
     fn peek_handler(r: &mut Request) -> IronResult<Response> {
-        // let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
-        let id = "test";
-        let _ = fetch_an_integer(id, true).unwrap_or(0i64);
+        {
+            let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
+            let _ = fetch_an_integer(id, true).unwrap_or(0i64);
+        }
 
         let mut img = ImageBuffer::new(512, 512);
 
@@ -99,16 +100,18 @@ fn main() {
                             apply_julia(&mut img, 500);
                         }
                     },
-                    None => {},
+                    None => {
+                        return Ok(Response::with((status::NotFound, "type not found")))
+                    },
                 }
             },
             Err(ref e) => {
-                println!("{:?}", e)
+                return Ok(Response::with((status::NotFound, format!("type parameter missing: {}", e))))
             }
         }
 
         let content_type = "image/png".parse::<Mime>().unwrap();
-        Ok(Response::with((content_type, status::Ok, GenImg{img: img})))
+        Ok(Response::with((content_type, status::Ok, ImgWriter{img: img})))
     }
 
     fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
