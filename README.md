@@ -1,4 +1,7 @@
-# peekaboo
+# Peekaboo
+
+[![Build Status](https://travis-ci.org/kujenga/peekaboo.svg?branch=master)](https://travis-ci.org/kujenga/peekaboo)
+
 A simple, image-based tracker and hit counter.
 
 This project is intended to help me learn and experiment with [rust](https://www.rust-lang.org) in the context of a web server.
