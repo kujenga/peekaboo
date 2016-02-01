@@ -5,8 +5,12 @@ extern crate redis;
 extern crate image;
 extern crate num;
 extern crate time;
+extern crate rustc_serialize;
+extern crate handlebars;
 
 use std::io;
+use rustc_serialize::json::{Json, ToJson};
+use std::collections::BTreeMap;
 use time::precise_time_ns;
 use iron::prelude::*;
 use iron::{
@@ -23,6 +27,7 @@ use router::Router;
 use redis::Commands;
 use image::ImageBuffer;
 use num::complex::Complex;
+use handlebars::Handlebars;
 
 fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
     // connect to redis
@@ -73,11 +78,80 @@ impl response::WriteBody for ImgWriter {
     }
 }
 
+static INDEX: &'static str = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Peekaboo</title>
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0-alpha.2/css/bootstrap.min.css" integrity="sha384-y3tfxAZXuh4HwSYylfB+J125MxIs6mR5FOHamPBG064zB+AFeWH94NdvaCBm8qnd" crossorigin="anonymous">
+    <style>
+    body {
+      padding-top: 5rem;
+    }
+    .lander {
+      padding: 3rem 1.5rem;
+      text-align: center;
+    }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="lander">
+        <h1><a href=\"https://github.com/kujenga/peekaboo\">Peekaboo</a> server</h1>
+    </div>
+</div>
+</body>
+</html>
+"#;
+
+static INFO: &'static str = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Peekaboo</title>
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0-alpha.2/css/bootstrap.min.css" integrity="sha384-y3tfxAZXuh4HwSYylfB+J125MxIs6mR5FOHamPBG064zB+AFeWH94NdvaCBm8qnd" crossorigin="anonymous">
+    <style>
+    body {
+      padding-top: 5rem;
+    }
+    .lander {
+      padding: 3rem 1.5rem;
+      text-align: center;
+    }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="lander">
+        <h1><a href=\"https://github.com/kujenga/peekaboo\">Peekaboo</a> server</h1>
+        <p>{{name}} has had {{count}} visitors!</p>
+    </div>
+</div>
+</body>
+</html>
+"#;
+
+struct Peek {
+  name: String,
+  count: i64,
+}
+
+impl ToJson for Peek {
+  fn to_json(&self) -> Json {
+    let mut m: BTreeMap<String, Json> = BTreeMap::new();
+    m.insert("name".to_string(), self.name.to_json());
+    m.insert("count".to_string(), self.count.to_json());
+    m.to_json()
+  }
+}
+
 fn main() {
+
 	fn handler(_: &mut Request) -> IronResult<Response> {
-        let content = "<a href=\"https://github.com/kujenga/peekaboo\">Peekaboo</a> server";
         let content_type = "text/html".parse::<Mime>().unwrap();
-		Ok(Response::with((content_type, status::Ok, content)))
+		Ok(Response::with((content_type, status::Ok, INDEX)))
 	}
 
     fn peek_handler(r: &mut Request) -> IronResult<Response> {
@@ -91,15 +165,10 @@ fn main() {
 
         match r.get_ref::<UrlEncodedQuery>() {
             Ok(ref hashmap) => {
-                match hashmap.get("t").map(|t| &t[0]) {
-                    Some(t) => {
-                        if t == "mandelbrot" {
-                            apply_mandelbrot(&mut img, 500);
-                        } else if t == "julia" {
-                            apply_julia(&mut img, 500);
-                        }
-                    },
-                    None => {
+                match hashmap.get("t").map(|t| t[0].as_ref()) {
+                    Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
+                    Some("julia") => apply_julia(&mut img, 500),
+                    Some(_) | None => {
                         return Ok(Response::with((status::NotFound, "type not found")))
                     },
                 }
@@ -119,10 +188,18 @@ fn main() {
     }
 
     fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
-        let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
-        let val = fetch_an_integer(id, false).unwrap_or(0i64);
+        let mut handlebars = Handlebars::new();
+        handlebars.register_template_string("info", INFO.to_string()).ok().unwrap();
 
-        Ok(Response::with((status::Ok, format!("'{}' has had {} visitors!", id, val))))
+        let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
+        let data = Peek {
+            name: id.to_string(),
+            count: fetch_an_integer(id, false).unwrap_or(0i64),
+        };
+
+        let content_type = "text/html".parse::<Mime>().unwrap();
+        let result = handlebars.render("info", &data);
+        Ok(Response::with((content_type, status::Ok, result.unwrap())))
     }
 
     let mut peek_chain = Chain::new(peek_handler);
