@@ -89,6 +89,7 @@ fn main() {
         }
 
         let mut img = ImageBuffer::new(512, 512);
+        let content_type = "image/png".parse::<Mime>().unwrap();
 
         match r.get_ref::<UrlEncodedQuery>() {
             Ok(ref hashmap) => {
@@ -105,12 +106,17 @@ fn main() {
                     },
                 }
             },
+            Err(urlencoded::UrlDecodingError::EmptyQuery) => {
+                // turn the image white
+                let mut img_sm = ImageBuffer::new(1, 1);
+                apply_color(&mut img_sm, 255);
+                return Ok(Response::with((content_type, status::Ok, ImgWriter{img: img_sm})))
+            },
             Err(ref e) => {
-                return Ok(Response::with((status::NotFound, format!("type parameter missing: {}", e))))
+                return Ok(Response::with((status::BadRequest, format!("invalid query: {}", e))))
             }
         }
 
-        let content_type = "image/png".parse::<Mime>().unwrap();
         Ok(Response::with((content_type, status::Ok, ImgWriter{img: img})))
     }
 
@@ -131,6 +137,12 @@ fn main() {
     router.get("/peek/:id/info", peek_info_handler);
 
 	Iron::new(router).http("localhost:2829").unwrap();
+}
+
+fn apply_color(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, value: u8) {
+    for (_, _, pixel) in img.enumerate_pixels_mut() {
+        *pixel = image::Luma([value]);
+    }
 }
 
 fn apply_mandelbrot(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) {
