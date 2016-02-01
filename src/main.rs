@@ -12,18 +12,16 @@ use iron::prelude::*;
 use iron::{
     BeforeMiddleware,
     AfterMiddleware,
-    typemap
+    typemap,
+    status,
+    response,
 };
 use iron::mime::Mime;
-use iron::status;
 use iron::modifier::Modifier;
-use iron::response;
 use urlencoded::UrlEncodedQuery;
 use router::Router;
 use redis::Commands;
-use image::{
-    ImageBuffer,
-};
+use image::ImageBuffer;
 use num::complex::Complex;
 
 fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
