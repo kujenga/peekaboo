@@ -9,6 +9,7 @@ extern crate rustc_serialize;
 extern crate handlebars;
 
 use std::io;
+// use std::path::Path;
 use rustc_serialize::json::{Json, ToJson};
 use std::collections::BTreeMap;
 use time::precise_time_ns;
@@ -78,12 +79,12 @@ impl response::WriteBody for ImgWriter {
     }
 }
 
-static INDEX: &'static str = r#"
+static BASE: &'static str = r#"
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>Peekaboo</title>
+    <title>{{title}}</title>
     <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0-alpha.2/css/bootstrap.min.css" integrity="sha384-y3tfxAZXuh4HwSYylfB+J125MxIs6mR5FOHamPBG064zB+AFeWH94NdvaCBm8qnd" crossorigin="anonymous">
     <style>
     body {
@@ -97,40 +98,30 @@ static INDEX: &'static str = r#"
 </head>
 <body>
 <div class="container">
-    <div class="lander">
-        <h1><a href=\"https://github.com/kujenga/peekaboo\">Peekaboo</a> server</h1>
-    </div>
+    {{~#block page}}{{/block~}}
 </div>
 </body>
 </html>
 "#;
 
-static INFO: &'static str = r#"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <title>Peekaboo</title>
-    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0-alpha.2/css/bootstrap.min.css" integrity="sha384-y3tfxAZXuh4HwSYylfB+J125MxIs6mR5FOHamPBG064zB+AFeWH94NdvaCBm8qnd" crossorigin="anonymous">
-    <style>
-    body {
-      padding-top: 5rem;
-    }
-    .lander {
-      padding: 3rem 1.5rem;
-      text-align: center;
-    }
-    </style>
-</head>
-<body>
-<div class="container">
+static INDEX: &'static str = r#"
+{{#partial page}}
     <div class="lander">
-        <h1><a href=\"https://github.com/kujenga/peekaboo\">Peekaboo</a> server</h1>
-        <p>{{name}} has had {{count}} visitors!</p>
+        <h1><a href="https://github.com/kujenga/peekaboo">Peekaboo</a> server</h1>
+        <p>I see you!<p>
     </div>
-</div>
-</body>
-</html>
+{{/partial}}
+{{~> base title=Peekaboo~}}
+"#;
+
+static INFO: &'static str = r#"
+{{#partial page}}
+    <div class="lander">
+        <h1><a href="https://github.com/kujenga/peekaboo">Peekaboo</a> server</h1>
+        <p><strong>{{name}}</strong> has had {{count}} visitors!</p>
+    </div>
+{{/partial}}
+{{~> base title=Peekaboo~}}
 "#;
 
 struct Peek {
@@ -149,10 +140,25 @@ impl ToJson for Peek {
 
 fn main() {
 
-	fn handler(_: &mut Request) -> IronResult<Response> {
+    fn handler(_: &mut Request) -> IronResult<Response> {
+        let mut handlebars = Handlebars::new();
+        match handlebars.register_template_string("base", BASE.to_string()) {
+            Ok(_) => {},
+            Err(err) => println!("error parsing header: {:?}", err),
+        }
+        match handlebars.register_template_string("index", INDEX.to_string()) {
+            Ok(_) => {},
+            Err(err) => println!("error parsing index: {:?}", err),
+        }
+
+        let data: BTreeMap<String, Json> = BTreeMap::new();
+
         let content_type = "text/html".parse::<Mime>().unwrap();
-		Ok(Response::with((content_type, status::Ok, INDEX)))
-	}
+        match handlebars.render("index", &data) {
+            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
+            Err(err) => Ok(Response::with((content_type, status::InternalServerError, format!("error: {}", err))))
+        }
+    }
 
     fn peek_handler(r: &mut Request) -> IronResult<Response> {
         {
@@ -189,7 +195,16 @@ fn main() {
 
     fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
         let mut handlebars = Handlebars::new();
-        handlebars.register_template_string("info", INFO.to_string()).ok().unwrap();
+        match handlebars.register_template_string("base", BASE.to_string()) {
+            Ok(_) => {},
+            Err(err) => println!("error parsing header: {:?}", err),
+        }
+        match handlebars.register_template_string("info", INFO.to_string()) {
+            Ok(_) => {},
+            Err(err) => println!("error parsing info: {:?}", err),
+        }
+        // handlebars.register_template_file("header", &Path::new("./src/header.hbs")).ok().unwrap();
+        // handlebars.register_template_file("info", &Path::new("./src/info.hbs")).ok().unwrap();
 
         let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
         let data = Peek {
@@ -198,8 +213,10 @@ fn main() {
         };
 
         let content_type = "text/html".parse::<Mime>().unwrap();
-        let result = handlebars.render("info", &data);
-        Ok(Response::with((content_type, status::Ok, result.unwrap())))
+        match handlebars.render("info", &data) {
+            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
+            Err(err) => Ok(Response::with((content_type, status::InternalServerError, format!("error: {}", err))))
+        }
     }
 
     let mut peek_chain = Chain::new(peek_handler);
@@ -211,7 +228,8 @@ fn main() {
     router.get("/peek/:id", peek_chain);
     router.get("/peek/:id/info", peek_info_handler);
 
-	Iron::new(router).http("localhost:2829").unwrap();
+	// s.run()
+    Iron::new(router).http("localhost:2829").unwrap();
 }
 
 fn apply_color(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, value: u8) {
