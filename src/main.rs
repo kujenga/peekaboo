@@ -1,42 +1,35 @@
-extern crate iron;
-extern crate router;
-extern crate urlencoded;
-extern crate redis;
-extern crate image;
-extern crate num;
-extern crate time;
-extern crate rustc_serialize;
 extern crate handlebars;
+extern crate image;
+extern crate iron;
+extern crate num;
+extern crate redis;
+extern crate router;
+extern crate serde;
+extern crate time;
+extern crate urlencoded;
 
-use std::io;
-// use std::path::Path;
-use rustc_serialize::json::{Json, ToJson};
-use std::collections::BTreeMap;
-use time::precise_time_ns;
-use iron::prelude::*;
-use iron::{
-    BeforeMiddleware,
-    AfterMiddleware,
-    typemap,
-    status,
-    response,
-};
+use handlebars::Handlebars;
+use image::{DynamicImage, ImageBuffer, ImageOutputFormat};
 use iron::mime::Mime;
 use iron::modifier::Modifier;
-use urlencoded::UrlEncodedQuery;
-use router::Router;
-use redis::Commands;
-use image::ImageBuffer;
+use iron::prelude::*;
+use iron::{response, status, typemap, AfterMiddleware, BeforeMiddleware};
 use num::complex::Complex;
-use handlebars::Handlebars;
+use redis::Commands;
+use router::Router;
+use serde_derive::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io;
+use time::OffsetDateTime;
+use urlencoded::UrlEncodedQuery;
 
 fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
     // connect to redis
-    let client = try!(redis::Client::open("redis://127.0.0.1/"));
-    let con = try!(client.get_connection());
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let mut con = client.get_connection()?;
     if inc {
         let cur = con.get(key).unwrap_or(0i64);
-        let _ : () = try!(con.set(key, cur+1));
+        let _: () = con.set(key, cur + 1)?;
     }
     con.get(key)
 }
@@ -44,26 +37,29 @@ fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
 // from: https://github.com/iron/iron/blob/master/examples/time.rs
 struct ResponseTime;
 
-impl typemap::Key for ResponseTime { type Value = u64; }
+impl typemap::Key for ResponseTime {
+    type Value = OffsetDateTime;
+}
 
 impl BeforeMiddleware for ResponseTime {
     fn before(&self, req: &mut Request) -> IronResult<()> {
-        req.extensions.insert::<ResponseTime>(precise_time_ns());
+        req.extensions
+            .insert::<ResponseTime>(OffsetDateTime::now_utc());
         Ok(())
     }
 }
 
 impl AfterMiddleware for ResponseTime {
     fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
-        let delta = precise_time_ns() - *req.extensions.get::<ResponseTime>().unwrap();
-        println!("Request took: {} ms", (delta as f64) / 1000000.0);
+        let delta = OffsetDateTime::now_utc() - *req.extensions.get::<ResponseTime>().unwrap();
+        println!("Request took: {} ms", delta.subsec_milliseconds());
         Ok(res)
     }
 }
 
 // ImgWriter writes a generated image out to the request
 struct ImgWriter {
-    img: ImageBuffer<image::Luma<u8>, Vec<u8>>
+    img: ImageBuffer<image::Luma<u8>, Vec<u8>>,
 }
 
 impl Modifier<Response> for ImgWriter {
@@ -73,9 +69,13 @@ impl Modifier<Response> for ImgWriter {
 }
 
 impl response::WriteBody for ImgWriter {
-    fn write_body(&mut self, res: &mut response::ResponseBody) -> io::Result<()> {
-        image::ImageLuma8(self.img.clone()).save(res, image::PNG)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    fn write_body(&mut self, res: &mut dyn io::Write) -> io::Result<()> {
+        // Write to intermediary buffer because Seek is required.
+        let mut bytes: Vec<u8> = Vec::new();
+        DynamicImage::ImageLuma8(self.img.clone())
+            .write_to(&mut io::Cursor::new(&mut bytes), ImageOutputFormat::Png)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        res.write_all(bytes.as_slice())
     }
 }
 
@@ -98,109 +98,117 @@ static BASE: &'static str = r#"
 </head>
 <body>
 <div class="container">
-    {{~#block page}}{{/block~}}
+    {{> page}}
 </div>
 </body>
 </html>
 "#;
 
 static INDEX: &'static str = r#"
-{{#partial page}}
+{{#*inline "page"}}
     <div class="lander">
         <h1><a href="https://github.com/kujenga/peekaboo">Peekaboo</a> server</h1>
         <p>I see you!<p>
     </div>
-{{/partial}}
+{{/inline}}
 {{~> base title=Peekaboo~}}
 "#;
 
 static INFO: &'static str = r#"
-{{#partial page}}
+{{#*inline "page"}}
     <div class="lander">
         <h1><a href="https://github.com/kujenga/peekaboo">Peekaboo</a> server</h1>
         <p><strong>{{name}}</strong> has had {{count}} visitors!</p>
     </div>
-{{/partial}}
+{{/inline}}
 {{~> base title=Peekaboo~}}
 "#;
 
+#[derive(Serialize, Deserialize, Debug)]
 struct Peek {
-  name: String,
-  count: i64,
-}
-
-impl ToJson for Peek {
-  fn to_json(&self) -> Json {
-    let mut m: BTreeMap<String, Json> = BTreeMap::new();
-    m.insert("name".to_string(), self.name.to_json());
-    m.insert("count".to_string(), self.count.to_json());
-    m.to_json()
-  }
+    name: String,
+    count: i64,
 }
 
 fn main() {
-
     fn handler(_: &mut Request) -> IronResult<Response> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => println!("error parsing header: {:?}", err),
         }
         match handlebars.register_template_string("index", INDEX.to_string()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => println!("error parsing index: {:?}", err),
         }
 
-        let data: BTreeMap<String, Json> = BTreeMap::new();
+        let data: BTreeMap<String, String> = BTreeMap::new();
 
         let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("index", &data) {
             Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((content_type, status::InternalServerError, format!("error: {}", err))))
+            Err(err) => Ok(Response::with((
+                content_type,
+                status::InternalServerError,
+                format!("error: {}", err),
+            ))),
         }
     }
 
     fn peek_handler(r: &mut Request) -> IronResult<Response> {
         {
             let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
-            let _ = fetch_an_integer(id, true).unwrap_or(0i64);
+            let _ = match fetch_an_integer(id, true) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error connecting to redis: {}", e);
+                    0i64
+                }
+            };
         }
 
         let mut img = ImageBuffer::new(512, 512);
         let content_type = "image/png".parse::<Mime>().unwrap();
 
         match r.get_ref::<UrlEncodedQuery>() {
-            Ok(ref hashmap) => {
-                match hashmap.get("t").map(|t| t[0].as_ref()) {
-                    Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
-                    Some("julia") => apply_julia(&mut img, 500),
-                    Some(_) | None => {
-                        return Ok(Response::with((status::NotFound, "type not found")))
-                    },
-                }
+            Ok(ref hashmap) => match hashmap.get("t").map(|t| t[0].as_ref()) {
+                Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
+                Some("julia") => apply_julia(&mut img, 500),
+                Some(_) | None => return Ok(Response::with((status::NotFound, "type not found"))),
             },
             Err(urlencoded::UrlDecodingError::EmptyQuery) => {
                 // turn the image white
                 let mut img_sm = ImageBuffer::new(1, 1);
                 apply_color(&mut img_sm, 255);
-                return Ok(Response::with((content_type, status::Ok, ImgWriter{img: img_sm})))
-            },
+                return Ok(Response::with((
+                    content_type,
+                    status::Ok,
+                    ImgWriter { img: img_sm },
+                )));
+            }
             Err(ref e) => {
-                return Ok(Response::with((status::BadRequest, format!("invalid query: {}", e))))
+                return Ok(Response::with((
+                    status::BadRequest,
+                    format!("invalid query: {}", e),
+                )))
             }
         }
 
-        Ok(Response::with((content_type, status::Ok, ImgWriter{img: img})))
+        Ok(Response::with((
+            content_type,
+            status::Ok,
+            ImgWriter { img: img },
+        )))
     }
 
     fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => println!("error parsing header: {:?}", err),
         }
         match handlebars.register_template_string("info", INFO.to_string()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => println!("error parsing info: {:?}", err),
         }
         // handlebars.register_template_file("header", &Path::new("./src/header.hbs")).ok().unwrap();
@@ -215,7 +223,11 @@ fn main() {
         let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("info", &data) {
             Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((content_type, status::InternalServerError, format!("error: {}", err))))
+            Err(err) => Ok(Response::with((
+                content_type,
+                status::InternalServerError,
+                format!("error: {}", err),
+            ))),
         }
     }
 
@@ -224,11 +236,11 @@ fn main() {
     peek_chain.link_after(ResponseTime);
 
     let mut router = Router::new();
-    router.get("/", handler);
-    router.get("/peek/:id", peek_chain);
-    router.get("/peek/:id/info", peek_info_handler);
+    router.get("/", handler, "index");
+    router.get("/peek/:id", peek_chain, "peek");
+    router.get("/peek/:id/info", peek_info_handler, "peek_info");
 
-	// s.run()
+    // s.run()
     Iron::new(router).http("localhost:2829").unwrap();
 }
 
@@ -239,14 +251,12 @@ fn apply_color(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, value: u8) {
 }
 
 fn apply_mandelbrot(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) {
-
     // from: https://en.wikipedia.org/wiki/Mandelbrot_set#Escape_time_algorithm
 
     let scalex = 3.5 / img.width() as f32;
     let scaley = 2.0 / img.height() as f32;
 
     for (x, y, pixel) in img.enumerate_pixels_mut() {
-
         let x0 = x as f32 * scalex - 2.5;
         let y0 = y as f32 * scaley - 1.0;
 
@@ -256,10 +266,10 @@ fn apply_mandelbrot(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: 
         let mut iters = 0;
         for _ in 0..max_iters {
             if z.norm() > 2.0 {
-                break
+                break;
             }
             let xt = z.re * z.re - z.im * z.im + x0;
-            z.im = 2.0*z.re*z.im + y0;
+            z.im = 2.0 * z.re * z.im + y0;
             z.re = xt;
 
             // for some reason this is about 2x slower
@@ -273,14 +283,12 @@ fn apply_mandelbrot(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: 
 }
 
 fn apply_julia(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) {
-
     // from: https://github.com/PistonDevelopers/image#62-generating-fractals
 
     let scalex = 4.0 / img.width() as f32;
     let scaley = 4.0 / img.height() as f32;
 
     for (x, y, pixel) in img.enumerate_pixels_mut() {
-
         let cy = y as f32 * scaley - 2.0;
         let cx = x as f32 * scalex - 2.0;
 
@@ -291,7 +299,7 @@ fn apply_julia(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) 
 
         for t in 0..max_iters {
             if z.norm() > 2.0 {
-                break
+                break;
             }
             z = z * z + c;
             i = t;

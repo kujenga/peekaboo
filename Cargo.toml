@@ -1,15 +1,17 @@
 [package]
 name = "peekaboo"
 version = "0.1.0"
-authors = ["kujenga <ataylor0123@gmail.com>"]
+authors = ["kujenga <git@ataylor.io>"]
+edition = "2021"
 
 [dependencies]
-iron = "*"
-router = "*"
+iron = "0.6"
+serde = "1"
+serde_derive = "1"
+router = "0.6"
 redis = "*"
-image = "*"
-num = "*"
-time = "*"
-urlencoded = "*"
-handlebars = "*"
-rustc-serialize = "0.3"
+image = "0.24"
+num = "0.4"
+time = "0.3"
+urlencoded = "0.6"
+handlebars = "4"
