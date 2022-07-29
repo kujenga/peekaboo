@@ -1,26 +1,42 @@
+extern crate axum;
 extern crate handlebars;
+extern crate http;
 extern crate image;
-extern crate iron;
 extern crate num;
 extern crate redis;
-extern crate router;
 extern crate serde;
 extern crate time;
+extern crate tracing;
 extern crate urlencoded;
 
+use axum::{
+    body::Bytes,
+    error_handling::HandleErrorLayer,
+    extract::{Extension, Path, Query},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{ErrorResponse, Html, IntoResponse, Response},
+    routing::get,
+    BoxError, Router,
+};
 use handlebars::Handlebars;
 use image::{DynamicImage, ImageBuffer, ImageOutputFormat};
-use iron::mime::Mime;
-use iron::modifier::Modifier;
-use iron::prelude::*;
-use iron::{response, status, typemap, AfterMiddleware, BeforeMiddleware};
 use num::complex::Complex;
 use redis::Commands;
-use router::Router;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use time::OffsetDateTime;
+use tower::ServiceBuilder;
+use tower_http::{
+    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+    LatencyUnit, ServiceBuilderExt,
+};
 use urlencoded::UrlEncodedQuery;
 
 fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
@@ -35,47 +51,53 @@ fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
 }
 
 // from: https://github.com/iron/iron/blob/master/examples/time.rs
-struct ResponseTime;
+// struct ResponseTime;
 
-impl typemap::Key for ResponseTime {
-    type Value = OffsetDateTime;
-}
+// impl typemap::Key for ResponseTime {
+//     type Value = OffsetDateTime;
+// }
 
-impl BeforeMiddleware for ResponseTime {
-    fn before(&self, req: &mut Request) -> IronResult<()> {
-        req.extensions
-            .insert::<ResponseTime>(OffsetDateTime::now_utc());
-        Ok(())
-    }
-}
+// impl BeforeMiddleware for ResponseTime {
+//     fn before(&self, req: &mut Request) -> IronResult<()> {
+//         req.extensions
+//             .insert::<ResponseTime>(OffsetDateTime::now_utc());
+//         Ok(())
+//     }
+// }
 
-impl AfterMiddleware for ResponseTime {
-    fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
-        let delta = OffsetDateTime::now_utc() - *req.extensions.get::<ResponseTime>().unwrap();
-        println!("Request took: {} ms", delta.subsec_milliseconds());
-        Ok(res)
-    }
-}
+// impl AfterMiddleware for ResponseTime {
+//     fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
+//         let delta = OffsetDateTime::now_utc() - *req.extensions.get::<ResponseTime>().unwrap();
+//         println!("Request took: {} ms", delta.subsec_milliseconds());
+//         Ok(res)
+//     }
+// }
 
 // ImgWriter writes a generated image out to the request
 struct ImgWriter {
     img: ImageBuffer<image::Luma<u8>, Vec<u8>>,
 }
 
-impl Modifier<Response> for ImgWriter {
-    fn modify(self, res: &mut Response) {
-        res.body = Some(Box::new(self));
-    }
-}
+// impl Modifier<Response> for ImgWriter {
+//     fn modify(self, res: &mut Response) {
+//         res.body = Some(Box::new(self));
+//     }
+// }
 
-impl response::WriteBody for ImgWriter {
-    fn write_body(&mut self, res: &mut dyn io::Write) -> io::Result<()> {
+impl IntoResponse for ImgWriter {
+    // fn write_body(&mut self, res: &mut dyn io::Write) -> io::Result<()> {
+    fn into_response(self) -> Response {
         // Write to intermediary buffer because Seek is required.
         let mut bytes: Vec<u8> = Vec::new();
         DynamicImage::ImageLuma8(self.img.clone())
             .write_to(&mut io::Cursor::new(&mut bytes), ImageOutputFormat::Png)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        res.write_all(bytes.as_slice())
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+
+        (StatusCode::OK, headers, bytes).into_response()
     }
 }
 
@@ -130,8 +152,28 @@ struct Peek {
     count: i64,
 }
 
-fn main() {
-    fn handler(_: &mut Request) -> IronResult<Response> {
+async fn handle_errors(err: BoxError) -> impl IntoResponse {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "Request took too long".to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unhandled internal error: {}", err),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct State {
+    db: Arc<RwLock<HashMap<String, Bytes>>>,
+}
+
+#[tokio::main]
+async fn main() {
+    async fn handler() -> Result<Html<String>, StatusCode> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
             Ok(_) => {}
@@ -144,21 +186,21 @@ fn main() {
 
         let data: BTreeMap<String, String> = BTreeMap::new();
 
-        let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("index", &data) {
-            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((
-                content_type,
-                status::InternalServerError,
-                format!("error: {}", err),
-            ))),
+            Ok(result) => Ok(Html(result)),
+            Err(err) => {
+                println!("error rendering index: {}", err);
+                Err(StatusCode::BAD_REQUEST)
+            }
         }
     }
 
-    fn peek_handler(r: &mut Request) -> IronResult<Response> {
+    async fn peek_handler(
+        Path(id): Path<String>,
+        params: Query<HashMap<String, String>>,
+    ) -> Result<ImgWriter, StatusCode> {
         {
-            let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
-            let _ = match fetch_an_integer(id, true) {
+            let _ = match fetch_an_integer(id.as_str(), true) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("error connecting to redis: {}", e);
@@ -168,40 +210,24 @@ fn main() {
         }
 
         let mut img = ImageBuffer::new(512, 512);
-        let content_type = "image/png".parse::<Mime>().unwrap();
+        // let content_type = "image/png".parse::<Mime>().unwrap();
 
-        match r.get_ref::<UrlEncodedQuery>() {
-            Ok(ref hashmap) => match hashmap.get("t").map(|t| t[0].as_ref()) {
-                Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
-                Some("julia") => apply_julia(&mut img, 500),
-                Some(_) | None => return Ok(Response::with((status::NotFound, "type not found"))),
-            },
-            Err(urlencoded::UrlDecodingError::EmptyQuery) => {
+        match params.get("t").map(|t| t.as_str()) {
+            Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
+            Some("julia") => apply_julia(&mut img, 500),
+            Some(_) => return Err(StatusCode::NOT_FOUND),
+            None => {
                 // turn the image white
                 let mut img_sm = ImageBuffer::new(1, 1);
                 apply_color(&mut img_sm, 255);
-                return Ok(Response::with((
-                    content_type,
-                    status::Ok,
-                    ImgWriter { img: img_sm },
-                )));
+                return Ok(ImgWriter { img: img_sm });
             }
-            Err(ref e) => {
-                return Ok(Response::with((
-                    status::BadRequest,
-                    format!("invalid query: {}", e),
-                )))
-            }
-        }
+        };
 
-        Ok(Response::with((
-            content_type,
-            status::Ok,
-            ImgWriter { img: img },
-        )))
+        Ok(ImgWriter { img: img })
     }
 
-    fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
+    async fn peek_info_handler(Path(id): Path<String>) -> Result<Html<String>, StatusCode> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
             Ok(_) => {}
@@ -211,37 +237,70 @@ fn main() {
             Ok(_) => {}
             Err(err) => println!("error parsing info: {:?}", err),
         }
-        // handlebars.register_template_file("header", &Path::new("./src/header.hbs")).ok().unwrap();
-        // handlebars.register_template_file("info", &Path::new("./src/info.hbs")).ok().unwrap();
 
-        let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
         let data = Peek {
-            name: id.to_string(),
-            count: fetch_an_integer(id, false).unwrap_or(0i64),
+            name: id.clone(),
+            count: fetch_an_integer(id.as_str(), false).unwrap_or(0i64),
         };
 
-        let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("info", &data) {
-            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((
-                content_type,
-                status::InternalServerError,
-                format!("error: {}", err),
-            ))),
+            Ok(result) => Ok(Html(result)),
+            Err(err) => {
+                println!("error rendering index: {}", err);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
     }
 
-    let mut peek_chain = Chain::new(peek_handler);
-    peek_chain.link_before(ResponseTime);
-    peek_chain.link_after(ResponseTime);
+    // Build our database for holding the key/value pairs
+    let state = State {
+        db: Arc::new(RwLock::new(HashMap::new())),
+    };
 
-    let mut router = Router::new();
-    router.get("/", handler, "index");
-    router.get("/peek/:id", peek_chain, "peek");
-    router.get("/peek/:id/info", peek_info_handler, "peek_info");
+    // Build our middleware stack
+    // ref: https://github.com/tower-rs/tower-http/blob/master/examples/axum-key-value-store/src/main.rs
+    let middleware = ServiceBuilder::new()
+        // Add high level tracing/logging to all requests
+        .layer(
+            TraceLayer::new_for_http()
+                // .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
+                //     tracing::trace!(size_bytes = chunk.len(), latency = ?latency, "sending body chunk")
+                // })
+                // .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                // .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
+        )
+        // Handle errors
+        .layer(HandleErrorLayer::new(handle_errors))
+        // Set a timeout
+        .timeout(Duration::from_secs(10))
+        // Share the state with each handler via a request extension
+        .add_extension(state)
+        // Compress responses
+        .compression()
+        // Set a `Content-Type` if there isn't one already.
+        .insert_response_header_if_not_present(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
 
-    // s.run()
-    Iron::new(router).http("localhost:2829").unwrap();
+    // let mut peek_chain = Chain::new(peek_handler);
+    // peek_chain.link_before(ResponseTime);
+    // peek_chain.link_after(ResponseTime);
+
+    let app = Router::new()
+        .route("/", get(handler))
+        .route("/peek/:id", get(peek_handler))
+        .route("/peek/:id/info", get(peek_info_handler))
+        .layer(middleware.into_inner());
+
+    // run our app with hyper
+    // `axum::Server` is a re-export of `hyper::Server`
+    let addr = SocketAddr::from(([127, 0, 0, 1], 2829));
+    tracing::debug!("listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
 fn apply_color(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, value: u8) {
