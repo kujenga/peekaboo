@@ -24,10 +24,24 @@ this counter is visible at `/peek/:id/info`. No authentication measures are
 implemented at present, so your best bet is to choose a randomly generated
 `:id`.
 
-It uses [iron](https://github.com/iron/iron) to handle HTTP interactions, and
-the [image](https://github.com/PistonDevelopers/image) crate to generate pngs.
+It uses [axum](https://github.com/tokio-rs/axum) for HTTP interactions, and
+the [image](https://github.com/image-rs/image) crate to generate PNGs.
+
+## Usage
+
+To run the server for local development, you can use the following command:
+
+```
+RUST_LOG=tower_http=trace cargo run
+```
+
+To run Redis for storing counters persistently, run:
+
+```
+docker run --rm -it -p 6379:6379 redis:7
+```
 
 ## Future ideas
 
-- [ ] Support for image size specified in query params
+- [ ] Support for image size specified in query parameters
 - [ ] Keep a log of timestamps for each tracker hit

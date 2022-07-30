@@ -1,83 +1,32 @@
+extern crate axum;
 extern crate handlebars;
+extern crate http;
 extern crate image;
-extern crate iron;
 extern crate num;
 extern crate redis;
-extern crate router;
 extern crate serde;
 extern crate time;
+extern crate tracing;
 extern crate urlencoded;
 
+use axum::{
+    error_handling::HandleErrorLayer,
+    extract::{Extension, Path, Query},
+    http::{header, HeaderValue, StatusCode},
+    response::{Html, IntoResponse},
+    routing::get,
+    BoxError, Router,
+};
 use handlebars::Handlebars;
-use image::{DynamicImage, ImageBuffer, ImageOutputFormat};
-use iron::mime::Mime;
-use iron::modifier::Modifier;
-use iron::prelude::*;
-use iron::{response, status, typemap, AfterMiddleware, BeforeMiddleware};
-use num::complex::Complex;
-use redis::Commands;
-use router::Router;
-use serde_derive::{Deserialize, Serialize};
+use image::ImageBuffer;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io;
-use time::OffsetDateTime;
-use urlencoded::UrlEncodedQuery;
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use tower::ServiceBuilder;
+use tower_http::{trace::TraceLayer, ServiceBuilderExt};
 
-fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
-    // connect to redis
-    let client = redis::Client::open("redis://127.0.0.1/")?;
-    let mut con = client.get_connection()?;
-    if inc {
-        let cur = con.get(key).unwrap_or(0i64);
-        let _: () = con.set(key, cur + 1)?;
-    }
-    con.get(key)
-}
-
-// from: https://github.com/iron/iron/blob/master/examples/time.rs
-struct ResponseTime;
-
-impl typemap::Key for ResponseTime {
-    type Value = OffsetDateTime;
-}
-
-impl BeforeMiddleware for ResponseTime {
-    fn before(&self, req: &mut Request) -> IronResult<()> {
-        req.extensions
-            .insert::<ResponseTime>(OffsetDateTime::now_utc());
-        Ok(())
-    }
-}
-
-impl AfterMiddleware for ResponseTime {
-    fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
-        let delta = OffsetDateTime::now_utc() - *req.extensions.get::<ResponseTime>().unwrap();
-        println!("Request took: {} ms", delta.subsec_milliseconds());
-        Ok(res)
-    }
-}
-
-// ImgWriter writes a generated image out to the request
-struct ImgWriter {
-    img: ImageBuffer<image::Luma<u8>, Vec<u8>>,
-}
-
-impl Modifier<Response> for ImgWriter {
-    fn modify(self, res: &mut Response) {
-        res.body = Some(Box::new(self));
-    }
-}
-
-impl response::WriteBody for ImgWriter {
-    fn write_body(&mut self, res: &mut dyn io::Write) -> io::Result<()> {
-        // Write to intermediary buffer because Seek is required.
-        let mut bytes: Vec<u8> = Vec::new();
-        DynamicImage::ImageLuma8(self.img.clone())
-            .write_to(&mut io::Cursor::new(&mut bytes), ImageOutputFormat::Png)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        res.write_all(bytes.as_slice())
-    }
-}
+mod counter;
+mod img;
 
 static BASE: &'static str = r#"
 <!DOCTYPE html>
@@ -130,8 +79,23 @@ struct Peek {
     count: i64,
 }
 
-fn main() {
-    fn handler(_: &mut Request) -> IronResult<Response> {
+async fn handle_errors(err: BoxError) -> impl IntoResponse {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "Request took too long".to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unhandled internal error: {}", err),
+        )
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    async fn handler() -> Result<Html<String>, StatusCode> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
             Ok(_) => {}
@@ -144,21 +108,22 @@ fn main() {
 
         let data: BTreeMap<String, String> = BTreeMap::new();
 
-        let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("index", &data) {
-            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((
-                content_type,
-                status::InternalServerError,
-                format!("error: {}", err),
-            ))),
+            Ok(result) => Ok(Html(result)),
+            Err(err) => {
+                println!("error rendering index: {}", err);
+                Err(StatusCode::BAD_REQUEST)
+            }
         }
     }
 
-    fn peek_handler(r: &mut Request) -> IronResult<Response> {
+    async fn peek_handler(
+        Extension(state): Extension<counter::State>,
+        Path(id): Path<String>,
+        params: Query<HashMap<String, String>>,
+    ) -> Result<img::ImgWriter, StatusCode> {
         {
-            let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
-            let _ = match fetch_an_integer(id, true) {
+            let _ = match state.inc(id) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("error connecting to redis: {}", e);
@@ -168,40 +133,27 @@ fn main() {
         }
 
         let mut img = ImageBuffer::new(512, 512);
-        let content_type = "image/png".parse::<Mime>().unwrap();
+        // let content_type = "image/png".parse::<Mime>().unwrap();
 
-        match r.get_ref::<UrlEncodedQuery>() {
-            Ok(ref hashmap) => match hashmap.get("t").map(|t| t[0].as_ref()) {
-                Some("mandelbrot") => apply_mandelbrot(&mut img, 500),
-                Some("julia") => apply_julia(&mut img, 500),
-                Some(_) | None => return Ok(Response::with((status::NotFound, "type not found"))),
-            },
-            Err(urlencoded::UrlDecodingError::EmptyQuery) => {
+        match params.get("t").map(|t| t.as_str()) {
+            Some("mandelbrot") => img::apply_mandelbrot(&mut img, 500),
+            Some("julia") => img::apply_julia(&mut img, 500),
+            Some(_) => return Err(StatusCode::NOT_FOUND),
+            None => {
                 // turn the image white
                 let mut img_sm = ImageBuffer::new(1, 1);
-                apply_color(&mut img_sm, 255);
-                return Ok(Response::with((
-                    content_type,
-                    status::Ok,
-                    ImgWriter { img: img_sm },
-                )));
+                img::apply_color(&mut img_sm, 255);
+                return Ok(img::ImgWriter { img: img_sm });
             }
-            Err(ref e) => {
-                return Ok(Response::with((
-                    status::BadRequest,
-                    format!("invalid query: {}", e),
-                )))
-            }
-        }
+        };
 
-        Ok(Response::with((
-            content_type,
-            status::Ok,
-            ImgWriter { img: img },
-        )))
+        Ok(img::ImgWriter { img: img })
     }
 
-    fn peek_info_handler(r: &mut Request) -> IronResult<Response> {
+    async fn peek_info_handler(
+        Extension(state): Extension<counter::State>,
+        Path(id): Path<String>,
+    ) -> Result<Html<String>, StatusCode> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
             Ok(_) => {}
@@ -211,102 +163,57 @@ fn main() {
             Ok(_) => {}
             Err(err) => println!("error parsing info: {:?}", err),
         }
-        // handlebars.register_template_file("header", &Path::new("./src/header.hbs")).ok().unwrap();
-        // handlebars.register_template_file("info", &Path::new("./src/info.hbs")).ok().unwrap();
 
-        let id = r.extensions.get::<Router>().unwrap().find("id").unwrap();
         let data = Peek {
-            name: id.to_string(),
-            count: fetch_an_integer(id, false).unwrap_or(0i64),
+            name: id.clone(),
+            count: state.get(id).unwrap_or(0i64),
         };
 
-        let content_type = "text/html".parse::<Mime>().unwrap();
         match handlebars.render("info", &data) {
-            Ok(result) => Ok(Response::with((content_type, status::Ok, result))),
-            Err(err) => Ok(Response::with((
-                content_type,
-                status::InternalServerError,
-                format!("error: {}", err),
-            ))),
-        }
-    }
-
-    let mut peek_chain = Chain::new(peek_handler);
-    peek_chain.link_before(ResponseTime);
-    peek_chain.link_after(ResponseTime);
-
-    let mut router = Router::new();
-    router.get("/", handler, "index");
-    router.get("/peek/:id", peek_chain, "peek");
-    router.get("/peek/:id/info", peek_info_handler, "peek_info");
-
-    // s.run()
-    Iron::new(router).http("localhost:2829").unwrap();
-}
-
-fn apply_color(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, value: u8) {
-    for (_, _, pixel) in img.enumerate_pixels_mut() {
-        *pixel = image::Luma([value]);
-    }
-}
-
-fn apply_mandelbrot(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) {
-    // from: https://en.wikipedia.org/wiki/Mandelbrot_set#Escape_time_algorithm
-
-    let scalex = 3.5 / img.width() as f32;
-    let scaley = 2.0 / img.height() as f32;
-
-    for (x, y, pixel) in img.enumerate_pixels_mut() {
-        let x0 = x as f32 * scalex - 2.5;
-        let y0 = y as f32 * scaley - 1.0;
-
-        let mut z = Complex::new(x0, y0);
-        // let c = z.clone();
-
-        let mut iters = 0;
-        for _ in 0..max_iters {
-            if z.norm() > 2.0 {
-                break;
+            Ok(result) => Ok(Html(result)),
+            Err(err) => {
+                println!("error rendering index: {}", err);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
-            let xt = z.re * z.re - z.im * z.im + x0;
-            z.im = 2.0 * z.re * z.im + y0;
-            z.re = xt;
-
-            // for some reason this is about 2x slower
-            // z = z * z + c;
-
-            iters += 1;
         }
-
-        *pixel = image::Luma([iters as u8]);
     }
-}
 
-fn apply_julia(img: &mut ImageBuffer<image::Luma<u8>, Vec<u8>>, max_iters: i64) {
-    // from: https://github.com/PistonDevelopers/image#62-generating-fractals
+    // Setup tracing
+    tracing_subscriber::fmt::init();
 
-    let scalex = 4.0 / img.width() as f32;
-    let scaley = 4.0 / img.height() as f32;
+    let state = counter::State::new("redis://127.0.0.1/");
 
-    for (x, y, pixel) in img.enumerate_pixels_mut() {
-        let cy = y as f32 * scaley - 2.0;
-        let cx = x as f32 * scalex - 2.0;
+    // Build our middleware stack
+    // ref: https://github.com/tower-rs/tower-http/blob/master/examples/axum-key-value-store/src/main.rs
+    let middleware = ServiceBuilder::new()
+        // Add high level tracing/logging to all requests
+        .layer(TraceLayer::new_for_http())
+        // Handle errors
+        .layer(HandleErrorLayer::new(handle_errors))
+        // Set a timeout
+        .timeout(Duration::from_secs(10))
+        // Share the state with each handler via a request extension
+        .add_extension(state)
+        // Compress responses
+        .compression()
+        // Set a `Content-Type` if there isn't one already.
+        .insert_response_header_if_not_present(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
 
-        let mut z = Complex::new(cx, cy);
-        let c = Complex::new(-0.4, 0.6);
+    let app = Router::new()
+        .route("/", get(handler))
+        .route("/peek/:id", get(peek_handler))
+        .route("/peek/:id/info", get(peek_info_handler))
+        .layer(middleware.into_inner());
 
-        let mut i = 0;
-
-        for t in 0..max_iters {
-            if z.norm() > 2.0 {
-                break;
-            }
-            z = z * z + c;
-            i = t;
-        }
-
-        // Create an 8bit pixel of type Luma and value i
-        // and assign in to the pixel at position (x, y)
-        *pixel = image::Luma([i as u8]);
-    }
+    // run our app with hyper
+    // `axum::Server` is a re-export of `hyper::Server`
+    let addr = SocketAddr::from(([127, 0, 0, 1], 2829));
+    tracing::debug!("listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
