@@ -12,7 +12,7 @@ extern crate urlencoded;
 use axum::{
     body::Bytes,
     error_handling::HandleErrorLayer,
-    extract::{Path, Query},
+    extract::{Extension, Path, Query},
     http::{header, HeaderValue, StatusCode},
     response::{Html, IntoResponse},
     routing::get,
@@ -20,35 +20,17 @@ use axum::{
 };
 use handlebars::Handlebars;
 use image::ImageBuffer;
-use redis::Commands;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use time::OffsetDateTime;
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use tower::ServiceBuilder;
 use tower_http::{
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
     LatencyUnit, ServiceBuilderExt,
 };
-use urlencoded::UrlEncodedQuery;
 
+mod counter;
 mod img;
-
-fn fetch_an_integer(key: &str, inc: bool) -> redis::RedisResult<i64> {
-    // connect to redis
-    let client = redis::Client::open("redis://127.0.0.1/")?;
-    let mut con = client.get_connection()?;
-    if inc {
-        let cur = con.get(key).unwrap_or(0i64);
-        let _: () = con.set(key, cur + 1)?;
-    }
-    con.get(key)
-}
 
 // from: https://github.com/iron/iron/blob/master/examples/time.rs
 // struct ResponseTime;
@@ -138,11 +120,6 @@ async fn handle_errors(err: BoxError) -> impl IntoResponse {
     }
 }
 
-#[derive(Clone, Debug)]
-struct State {
-    db: Arc<RwLock<HashMap<String, Bytes>>>,
-}
-
 #[tokio::main]
 async fn main() {
     async fn handler() -> Result<Html<String>, StatusCode> {
@@ -168,11 +145,12 @@ async fn main() {
     }
 
     async fn peek_handler(
+        Extension(state): Extension<counter::State>,
         Path(id): Path<String>,
         params: Query<HashMap<String, String>>,
     ) -> Result<img::ImgWriter, StatusCode> {
         {
-            let _ = match fetch_an_integer(id.as_str(), true) {
+            let _ = match state.inc(id) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("error connecting to redis: {}", e);
@@ -199,7 +177,10 @@ async fn main() {
         Ok(img::ImgWriter { img: img })
     }
 
-    async fn peek_info_handler(Path(id): Path<String>) -> Result<Html<String>, StatusCode> {
+    async fn peek_info_handler(
+        Extension(state): Extension<counter::State>,
+        Path(id): Path<String>,
+    ) -> Result<Html<String>, StatusCode> {
         let mut handlebars = Handlebars::new();
         match handlebars.register_template_string("base", BASE.to_string()) {
             Ok(_) => {}
@@ -212,7 +193,7 @@ async fn main() {
 
         let data = Peek {
             name: id.clone(),
-            count: fetch_an_integer(id.as_str(), false).unwrap_or(0i64),
+            count: state.get(id).unwrap_or(0i64),
         };
 
         match handlebars.render("info", &data) {
@@ -224,10 +205,7 @@ async fn main() {
         }
     }
 
-    // Build our database for holding the key/value pairs
-    let state = State {
-        db: Arc::new(RwLock::new(HashMap::new())),
-    };
+    let state = counter::State::new("redis://127.0.0.1/");
 
     // Build our middleware stack
     // ref: https://github.com/tower-rs/tower-http/blob/master/examples/axum-key-value-store/src/main.rs
