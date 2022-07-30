@@ -10,7 +10,6 @@ extern crate tracing;
 extern crate urlencoded;
 
 use axum::{
-    body::Bytes,
     error_handling::HandleErrorLayer,
     extract::{Extension, Path, Query},
     http::{header, HeaderValue, StatusCode},
@@ -24,36 +23,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use tower::ServiceBuilder;
-use tower_http::{
-    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
-    LatencyUnit, ServiceBuilderExt,
-};
+use tower_http::{trace::TraceLayer, ServiceBuilderExt};
 
 mod counter;
 mod img;
-
-// from: https://github.com/iron/iron/blob/master/examples/time.rs
-// struct ResponseTime;
-
-// impl typemap::Key for ResponseTime {
-//     type Value = OffsetDateTime;
-// }
-
-// impl BeforeMiddleware for ResponseTime {
-//     fn before(&self, req: &mut Request) -> IronResult<()> {
-//         req.extensions
-//             .insert::<ResponseTime>(OffsetDateTime::now_utc());
-//         Ok(())
-//     }
-// }
-
-// impl AfterMiddleware for ResponseTime {
-//     fn after(&self, req: &mut Request, res: Response) -> IronResult<Response> {
-//         let delta = OffsetDateTime::now_utc() - *req.extensions.get::<ResponseTime>().unwrap();
-//         println!("Request took: {} ms", delta.subsec_milliseconds());
-//         Ok(res)
-//     }
-// }
 
 static BASE: &'static str = r#"
 <!DOCTYPE html>
@@ -205,20 +178,16 @@ async fn main() {
         }
     }
 
+    // Setup tracing
+    tracing_subscriber::fmt::init();
+
     let state = counter::State::new("redis://127.0.0.1/");
 
     // Build our middleware stack
     // ref: https://github.com/tower-rs/tower-http/blob/master/examples/axum-key-value-store/src/main.rs
     let middleware = ServiceBuilder::new()
         // Add high level tracing/logging to all requests
-        .layer(
-            TraceLayer::new_for_http()
-                .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
-                    tracing::trace!(size_bytes = chunk.len(), latency = ?latency, "sending body chunk")
-                })
-                .make_span_with(DefaultMakeSpan::new().include_headers(true))
-                .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
-        )
+        .layer(TraceLayer::new_for_http())
         // Handle errors
         .layer(HandleErrorLayer::new(handle_errors))
         // Set a timeout
@@ -232,10 +201,6 @@ async fn main() {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
-
-    // let mut peek_chain = Chain::new(peek_handler);
-    // peek_chain.link_before(ResponseTime);
-    // peek_chain.link_after(ResponseTime);
 
     let app = Router::new()
         .route("/", get(handler))
